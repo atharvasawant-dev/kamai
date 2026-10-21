@@ -91,7 +91,7 @@ export default function Settings({
       setMessage(
         `Restored ${result.data.orderCount} orders${
           result.data.settingsUpdated ? ' + settings' : ''
-        } ✓`
+        }${result.data.skippedCount ? ` · ${result.data.skippedCount} skipped` : ''} ✓`
       )
       setTimeout(() => setMessage(''), 3000)
     }

@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid'
-import { DEFAULT_SETTINGS, EXPORT_VERSION, PLATFORMS, STORAGE_KEYS } from './constants'
+import { DEFAULT_SETTINGS, EXPORT_VERSION, PLATFORMS, STORAGE_KEYS } from './constants.js'
 
 /**
  * All localStorage ops return { ok, data?, error? } so UI never crashes silently.
@@ -188,18 +188,22 @@ export function getSettings() {
   return { ok: parsed.ok, data, error: parsed.ok ? undefined : parsed.error }
 }
 
-export function saveSettings(settings) {
-  const next = {
+function normalizeSettings(settings) {
+  return {
     mileageKmPerLitre:
-      Number(settings.mileageKmPerLitre) > 0
+      Number(settings?.mileageKmPerLitre) > 0
         ? Number(settings.mileageKmPerLitre)
         : DEFAULT_SETTINGS.mileageKmPerLitre,
     petrolPricePerLitre:
-      Number(settings.petrolPricePerLitre) > 0
+      Number(settings?.petrolPricePerLitre) > 0
         ? Number(settings.petrolPricePerLitre)
         : DEFAULT_SETTINGS.petrolPricePerLitre,
     currency: 'INR',
   }
+}
+
+export function saveSettings(settings) {
+  const next = normalizeSettings(settings)
   const write = writeRaw(STORAGE_KEYS.SETTINGS, JSON.stringify(next))
   return write.ok ? { ok: true, data: next } : { ok: false, error: write.error }
 }
@@ -259,7 +263,17 @@ export function clearTimerState() {
 /** Build export payload for download */
 export function buildExportPayload() {
   const orders = getOrders()
+  // Never produce an "ok" backup from data we could not read — it would be
+  // silently empty and a later Import of it would wipe the real orders.
+  if (!orders.ok) {
+    return { ok: false, error: `Export failed: ${orders.error || 'could not read saved orders'}` }
+  }
+  // Same rule for settings: getSettings() falls back to defaults when storage
+  // is unreadable or the saved JSON is corrupt, so check `ok` before trusting it.
   const settings = getSettings()
+  if (!settings.ok) {
+    return { ok: false, error: `Export failed: ${settings.error || 'could not read saved settings'}` }
+  }
   return {
     ok: true,
     data: {
@@ -267,7 +281,7 @@ export function buildExportPayload() {
       app: 'kamai',
       exportedAt: new Date().toISOString(),
       settings: settings.data,
-      orders: orders.data || [],
+      orders: orders.data,
     },
   }
 }
@@ -275,6 +289,7 @@ export function buildExportPayload() {
 export function downloadExport() {
   try {
     const payload = buildExportPayload()
+    if (!payload.ok) return payload
     const blob = new Blob([JSON.stringify(payload.data, null, 2)], {
       type: 'application/json',
     })
@@ -291,6 +306,17 @@ export function downloadExport() {
   } catch (e) {
     return { ok: false, error: `Export failed: ${e?.message || 'unknown error'}` }
   }
+}
+
+/** Put raw values back (null = remove the key). Returns a list of errors. */
+function restoreSnapshot(snapshot, keys) {
+  const errors = []
+  for (const key of keys) {
+    const value = snapshot[key]
+    const r = value == null ? removeRaw(key) : writeRaw(key, value)
+    if (!r.ok) errors.push(`${key}: ${r.error}`)
+  }
+  return errors
 }
 
 /**
@@ -317,19 +343,70 @@ export function importFromJson(jsonText) {
       return { ok: false, error: 'Invalid backup file format.' }
     }
 
-    const normalized = orders.map(normalizeOrder).filter(Boolean)
-    const savedOrders = saveOrders(normalized)
-    if (!savedOrders.ok) return savedOrders
+    // Same invariant the log/edit forms enforce: earnings > 0 and time > 0.
+    const normalized = orders
+      .map(normalizeOrder)
+      .filter((o) => o && o.earnings > 0 && o.timeMinutes > 0)
+    const skippedCount = orders.length - normalized.length
+    if (orders.length > 0 && normalized.length === 0) {
+      return {
+        ok: false,
+        error: 'Import failed: no valid orders found in that file. Existing data was kept.',
+      }
+    }
+    // localStorage has no transactions, so snapshot the raw values of both keys,
+    // write, and restore the snapshot if any write fails.
+    const snapshot = {}
+    for (const key of [STORAGE_KEYS.ORDERS, STORAGE_KEYS.SETTINGS]) {
+      const read = readRaw(key)
+      if (!read.ok) {
+        return {
+          ok: false,
+          error: `Import failed: could not back up current data first (${read.error}). Existing data was kept.`,
+        }
+      }
+      snapshot[key] = read.data // null means "key was absent"
+    }
 
-    if (settings) {
-      const savedSettings = saveSettings(settings)
-      if (!savedSettings.ok) return savedSettings
+    // A failed setItem leaves its key untouched, so only keys that were
+    // actually written need restoring.
+    const written = []
+    let writeError = null
+    const ordersWrite = writeRaw(STORAGE_KEYS.ORDERS, JSON.stringify(normalized))
+    if (ordersWrite.ok) written.push(STORAGE_KEYS.ORDERS)
+    else writeError = ordersWrite.error
+    if (!writeError && settings) {
+      const settingsWrite = writeRaw(
+        STORAGE_KEYS.SETTINGS,
+        JSON.stringify(normalizeSettings(settings))
+      )
+      if (settingsWrite.ok) written.push(STORAGE_KEYS.SETTINGS)
+      else writeError = settingsWrite.error
+    }
+
+    if (writeError) {
+      const rollbackErrors = restoreSnapshot(snapshot, written)
+      if (rollbackErrors.length > 0) {
+        return {
+          ok: false,
+          rollbackFailed: true,
+          error:
+            `Import failed (${writeError}) and the previous data could not be fully restored ` +
+            `(${rollbackErrors.join('; ')}). Your saved data may be incomplete — ` +
+            'export or re-import a backup as soon as possible.',
+        }
+      }
+      return {
+        ok: false,
+        error: `Import failed: ${writeError} Your existing data was restored unchanged.`,
+      }
     }
 
     return {
       ok: true,
       data: {
         orderCount: normalized.length,
+        skippedCount,
         settingsUpdated: Boolean(settings),
       },
     }
