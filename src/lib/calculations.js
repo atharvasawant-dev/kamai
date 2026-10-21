@@ -1,3 +1,5 @@
+import { DEFAULT_SETTINGS } from './constants.js'
+
 /** Local calendar date key YYYY-MM-DD */
 export function toDateKey(date) {
   const d = date instanceof Date ? date : new Date(date)
@@ -50,19 +52,31 @@ export function formatINRPrecise(amount) {
 }
 
 export function formatHours(minutes) {
-  const mins = Number(minutes) || 0
-  const h = Math.floor(mins / 60)
-  const m = Math.round(mins % 60)
+  // Round first so fractional minutes can't render as "60 min" / "1h 60m".
+  const total = Math.round(Number(minutes) || 0)
+  const h = Math.floor(total / 60)
+  const m = total % 60
   if (h === 0) return `${m} min`
   if (m === 0) return `${h}h`
   return `${h}h ${m}m`
 }
 
-export function estimateFuelCost(distanceKm, settings) {
-  const mileage = Number(settings.mileageKmPerLitre) || 40
-  const price = Number(settings.petrolPricePerLitre) || 100
-  if (mileage <= 0) return 0
-  return (Number(distanceKm) / mileage) * price
+function positiveOr(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+/**
+ * fuel cost = (distance_km / mileage_km_per_l) * petrol_price_per_l
+ * Missing, zero, negative or non-numeric settings fall back to DEFAULT_SETTINGS.
+ * Non-positive or non-numeric distance costs nothing (never negative / NaN).
+ */
+export function estimateFuelCost(distanceKm, settings = {}) {
+  const mileage = positiveOr(settings.mileageKmPerLitre, DEFAULT_SETTINGS.mileageKmPerLitre)
+  const price = positiveOr(settings.petrolPricePerLitre, DEFAULT_SETTINGS.petrolPricePerLitre)
+  const km = Number(distanceKm)
+  if (!Number.isFinite(km) || km <= 0) return 0
+  return (km / mileage) * price
 }
 
 /**
