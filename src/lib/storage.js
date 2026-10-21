@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid'
-import { DEFAULT_SETTINGS, EXPORT_VERSION, PLATFORMS, STORAGE_KEYS } from './constants'
+import { DEFAULT_SETTINGS, EXPORT_VERSION, PLATFORMS, STORAGE_KEYS } from './constants.js'
 
 /**
  * All localStorage ops return { ok, data?, error? } so UI never crashes silently.
@@ -259,6 +259,11 @@ export function clearTimerState() {
 /** Build export payload for download */
 export function buildExportPayload() {
   const orders = getOrders()
+  // Never produce an "ok" backup from data we could not read — it would be
+  // silently empty and a later Import of it would wipe the real orders.
+  if (!orders.ok) {
+    return { ok: false, error: `Export failed: ${orders.error || 'could not read saved orders'}` }
+  }
   const settings = getSettings()
   return {
     ok: true,
@@ -267,7 +272,7 @@ export function buildExportPayload() {
       app: 'kamai',
       exportedAt: new Date().toISOString(),
       settings: settings.data,
-      orders: orders.data || [],
+      orders: orders.data,
     },
   }
 }
@@ -275,6 +280,7 @@ export function buildExportPayload() {
 export function downloadExport() {
   try {
     const payload = buildExportPayload()
+    if (!payload.ok) return payload
     const blob = new Blob([JSON.stringify(payload.data, null, 2)], {
       type: 'application/json',
     })
@@ -317,7 +323,17 @@ export function importFromJson(jsonText) {
       return { ok: false, error: 'Invalid backup file format.' }
     }
 
-    const normalized = orders.map(normalizeOrder).filter(Boolean)
+    // Same invariant the log/edit forms enforce: earnings > 0 and time > 0.
+    const normalized = orders
+      .map(normalizeOrder)
+      .filter((o) => o && o.earnings > 0 && o.timeMinutes > 0)
+    const skippedCount = orders.length - normalized.length
+    if (orders.length > 0 && normalized.length === 0) {
+      return {
+        ok: false,
+        error: 'Import failed: no valid orders found in that file. Existing data was kept.',
+      }
+    }
     const savedOrders = saveOrders(normalized)
     if (!savedOrders.ok) return savedOrders
 
@@ -330,6 +346,7 @@ export function importFromJson(jsonText) {
       ok: true,
       data: {
         orderCount: normalized.length,
+        skippedCount,
         settingsUpdated: Boolean(settings),
       },
     }
