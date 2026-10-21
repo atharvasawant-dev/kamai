@@ -210,3 +210,185 @@ test('resetAllData removes orders, settings and timer state', () => {
   assert.equal(getSettings().data.mileageKmPerLitre, 40)
   assert.equal(store.has('kamai_timer'), false)
 })
+
+// ---- import atomicity + export settings checks ------------------------------
+
+/** Make setItem throw for the given keys (until the returned restore() is called). */
+function failWritesTo(failKeys, { afterFirstFailure = null } = {}) {
+  const realSet = globalThis.localStorage.setItem
+  let tripped = false
+  globalThis.localStorage.setItem = (k, v) => {
+    const shouldFail =
+      failKeys.includes(k) || (tripped && afterFirstFailure && afterFirstFailure.includes(k))
+    if (shouldFail) {
+      tripped = true
+      const err = new Error('full')
+      err.name = 'QuotaExceededError'
+      throw err
+    }
+    realSet(k, v)
+  }
+  return () => {
+    globalThis.localStorage.setItem = realSet
+  }
+}
+
+const backupJson = () =>
+  JSON.stringify({
+    version: 1,
+    app: 'kamai',
+    orders: [goodOrder({ id: 'new1', earnings: 999 })],
+    settings: { mileageKmPerLitre: 55, petrolPricePerLitre: 150 },
+  })
+
+function seedExisting() {
+  addOrder({ platform: 'Swiggy', earnings: 80, distance: 3, timeMinutes: 20 })
+  saveSettings({ mileageKmPerLitre: 30, petrolPricePerLitre: 120 })
+  return {
+    orders: store.get('kamai_orders'),
+    settings: store.get('kamai_settings'),
+  }
+}
+
+test('import: settings-save failure keeps existing orders and settings unchanged', () => {
+  const before = seedExisting()
+  const restore = failWritesTo(['kamai_settings'])
+  let r
+  try {
+    r = importFromJson(backupJson())
+  } finally {
+    restore()
+  }
+  assert.equal(r.ok, false)
+  assert.match(r.error, /storage full/i)
+  assert.match(r.error, /restored unchanged/i)
+  assert.equal(r.rollbackFailed, undefined)
+  // byte-for-byte identical to before the import
+  assert.equal(store.get('kamai_orders'), before.orders)
+  assert.equal(store.get('kamai_settings'), before.settings)
+})
+
+test('import: order-save failure leaves imported settings unapplied', () => {
+  const before = seedExisting()
+  const restore = failWritesTo(['kamai_orders'])
+  let r
+  try {
+    r = importFromJson(backupJson())
+  } finally {
+    restore()
+  }
+  assert.equal(r.ok, false)
+  assert.match(r.error, /storage full/i)
+  assert.equal(store.get('kamai_orders'), before.orders)
+  assert.equal(store.get('kamai_settings'), before.settings)
+  assert.equal(getSettings().data.mileageKmPerLitre, 30)
+})
+
+test('import: failure on a fresh install removes keys instead of leaving partial data', () => {
+  // nothing stored yet -> rollback must delete the orders that were just written
+  const restore = failWritesTo(['kamai_settings'])
+  let r
+  try {
+    r = importFromJson(backupJson())
+  } finally {
+    restore()
+  }
+  assert.equal(r.ok, false)
+  assert.equal(store.has('kamai_orders'), false)
+  assert.equal(store.has('kamai_settings'), false)
+})
+
+test('import: failure preserves corrupted existing data byte-for-byte', () => {
+  store.set('kamai_orders', '{not json')
+  store.set('kamai_settings', '{also bad')
+  const restore = failWritesTo(['kamai_settings'])
+  try {
+    assert.equal(importFromJson(backupJson()).ok, false)
+  } finally {
+    restore()
+  }
+  assert.equal(store.get('kamai_orders'), '{not json')
+  assert.equal(store.get('kamai_settings'), '{also bad')
+})
+
+test('import: reports rollbackFailed when the previous data cannot be restored', () => {
+  const before = seedExisting()
+  // Settings write fails, and afterwards the orders restore fails too.
+  const restore = failWritesTo(['kamai_settings'], { afterFirstFailure: ['kamai_orders'] })
+  let r
+  try {
+    r = importFromJson(backupJson())
+  } finally {
+    restore()
+  }
+  assert.equal(r.ok, false)
+  assert.equal(r.rollbackFailed, true)
+  assert.match(r.error, /could not be fully restored/i)
+  assert.match(r.error, /kamai_orders/)
+  // confirms the scenario really was a partial state, which the error warns about
+  assert.notEqual(store.get('kamai_orders'), before.orders)
+})
+
+test('import: aborts before writing anything if current data cannot be read', () => {
+  const realGet = globalThis.localStorage.getItem
+  const realSet = globalThis.localStorage.setItem
+  let writes = 0
+  globalThis.localStorage.getItem = () => {
+    throw new Error('read blocked')
+  }
+  globalThis.localStorage.setItem = (k, v) => {
+    if (k !== '__kamai_test__') writes += 1
+    realSet(k, v)
+  }
+  let r
+  try {
+    r = importFromJson(backupJson())
+  } finally {
+    globalThis.localStorage.getItem = realGet
+    globalThis.localStorage.setItem = realSet
+  }
+  assert.equal(r.ok, false)
+  assert.match(r.error, /back up current data/i)
+  assert.equal(writes, 0)
+})
+
+test('import: successful import still replaces both orders and settings', () => {
+  seedExisting()
+  const r = importFromJson(backupJson())
+  assert.deepEqual(r, { ok: true, data: { orderCount: 1, skippedCount: 0, settingsUpdated: true } })
+  assert.equal(getOrders().data[0].earnings, 999)
+  assert.equal(getSettings().data.mileageKmPerLitre, 55)
+})
+
+test('export fails when saved settings are corrupted', () => {
+  addOrder({ platform: 'Uber', earnings: 50, distance: 2, timeMinutes: 15 })
+  store.set('kamai_settings', '{not json')
+  const r = buildExportPayload()
+  assert.equal(r.ok, false)
+  assert.match(r.error, /Export failed/)
+  assert.match(r.error, /corrupted/i)
+  assert.equal(r.data, undefined)
+})
+
+test('export fails when storage cannot be read at all', () => {
+  const realGet = globalThis.localStorage.getItem
+  const realSet = globalThis.localStorage.setItem
+  globalThis.localStorage.setItem = () => {
+    throw new Error('blocked')
+  }
+  let r
+  try {
+    r = buildExportPayload()
+  } finally {
+    globalThis.localStorage.getItem = realGet
+    globalThis.localStorage.setItem = realSet
+  }
+  assert.equal(r.ok, false)
+  assert.match(r.error, /Export failed/)
+})
+
+test('export still succeeds with default settings when none were ever saved', () => {
+  const r = buildExportPayload()
+  assert.equal(r.ok, true)
+  assert.equal(r.data.settings.petrolPricePerLitre, 105)
+})
