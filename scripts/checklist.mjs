@@ -1,57 +1,14 @@
 /**
  * Kamai self-check — runs checklist scenarios without a browser.
- * Uses same calculation + validation logic paths.
+ * Imports the real calculation + validation modules (no copied formulas).
  */
 import { readFileSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
+import { aggregateOrders, estimateFuelCost } from '../src/lib/calculations.js'
+import { parsePositiveNumber } from '../src/lib/validation.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-
-// Lightweight reimplementation mirroring production formulas
-function estimateFuelCost(distanceKm, settings) {
-  const mileage = Number(settings.mileageKmPerLitre) || 40
-  const price = Number(settings.petrolPricePerLitre) || 105
-  if (mileage <= 0) return 0
-  return (Number(distanceKm) / mileage) * price
-}
-
-function aggregateOrders(orders, settings) {
-  const totalEarnings = orders.reduce((s, o) => s + (Number(o.earnings) || 0), 0)
-  const totalDistance = orders.reduce((s, o) => s + (Number(o.distance) || 0), 0)
-  const totalMinutes = orders.reduce((s, o) => s + (Number(o.timeMinutes) || 0), 0)
-  const totalHours = totalMinutes / 60
-  const fuelCost = estimateFuelCost(totalDistance, settings)
-  const netEarnings = totalEarnings - fuelCost
-  const realPerHour = totalHours > 0 ? netEarnings / totalHours : null
-
-  const byPlatform = {}
-  for (const o of orders) {
-    const p = o.platform || 'Other'
-    if (!byPlatform[p]) byPlatform[p] = { platform: p, count: 0, earnings: 0, distance: 0, minutes: 0 }
-    byPlatform[p].count += 1
-    byPlatform[p].earnings += Number(o.earnings) || 0
-    byPlatform[p].distance += Number(o.distance) || 0
-    byPlatform[p].minutes += Number(o.timeMinutes) || 0
-  }
-  const platformRows = Object.values(byPlatform).map((row) => {
-    const hours = row.minutes / 60
-    const fuel = estimateFuelCost(row.distance, settings)
-    const net = row.earnings - fuel
-    return { ...row, realPerHour: hours > 0 ? net / hours : null }
-  })
-  return { totalEarnings, totalDistance, totalHours, fuelCost, netEarnings, realPerHour, platformRows, orderCount: orders.length }
-}
-
-function parsePositiveNumber(value, { allowZero = false } = {}) {
-  if (value === '' || value == null) return { ok: false }
-  const raw = String(value).trim()
-  if (!/^-?\d*\.?\d+$/.test(raw)) return { ok: false }
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return { ok: false }
-  if (allowZero ? n < 0 : n <= 0) return { ok: false }
-  return { ok: true, value: n }
-}
 
 const settings = { mileageKmPerLitre: 40, petrolPricePerLitre: 105 }
 let passed = 0
@@ -108,13 +65,13 @@ assert('1 platform left', stats.platformRows.length === 1)
 console.log('\n4. Zero hours guard')
 stats = aggregateOrders([], settings)
 assert('empty realPerHour null', stats.realPerHour === null)
-assert('not NaN', stats.realPerHour !== NaN && !Number.isNaN(stats.realPerHour))
+assert('not NaN', !Number.isNaN(stats.realPerHour))
 const zeroTime = aggregateOrders(
   [{ earnings: 50, distance: 1, timeMinutes: 0, platform: 'Uber' }],
   settings
 )
 assert('0 minutes → null rate', zeroTime.realPerHour === null)
-assert('display safe', zeroTime.realPerHour == null ? 'Log your first order' : String(zeroTime.realPerHour))
+assert('display safe (no NaN/Infinity shown)', zeroTime.realPerHour === null)
 
 // 5. localStorage shape persistence (simulated export/import)
 console.log('\n5. Persistence shape (export/import)')
